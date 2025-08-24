@@ -86,5 +86,7 @@ def inference( symbol):
     else:    
         return "DOWN"
 
+
+#just for testing purpose
 if __name__ == '__main__':
     print(inference("NABIL"))
