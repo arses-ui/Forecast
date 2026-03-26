@@ -1,36 +1,35 @@
-import pandas as pd
-import numpy as np 
+from __future__ import annotations
+
 import datetime
 import time
-from nepse_scraper import Nepse_scraper
+from pathlib import Path
+
 import joblib
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+import numpy as np
+import pandas as pd
+from nepse_scraper import Nepse_scraper
+
+from dataset_utils import FEATURE_COLUMNS
 
 
-def build_sequences(group, window_size=7, feature_cols=["open", "high", "low", "close", "volume", "ma_5", "volatility_10"]
-):
+MODEL_DIR = Path(__file__).resolve().parent
+
+
+def build_sequences(group, window_size=7, feature_cols=FEATURE_COLUMNS):
     X = []
     data = group[feature_cols].values
     for i in range(len(data) - window_size):
-        X.append(data[i:i+window_size])
+        X.append(data[i : i + window_size])
     return np.array(X)
 
 
-def data_formatting(symbol, window_size = 7, feature_cols=["open", "high", "low", "close", "volume", "ma_5", "volatility_10"]): 
-
-    # 1. Fetch data from NEPSE
+def data_formatting(symbol, window_size=7, feature_cols=FEATURE_COLUMNS):
     scraper = Nepse_scraper()
     start_date = datetime.date.today()
 
-    all_data = []
-    start_date = datetime.date.today()
-    end_date = start_date - datetime.timedelta(days=15)  # last 10 days for demo
-
+    end_date = start_date - datetime.timedelta(days=15)
     all_data = []
 
-    # loop day by day
     current = start_date
     while current >= end_date:
         try:
@@ -49,44 +48,60 @@ def data_formatting(symbol, window_size = 7, feature_cols=["open", "high", "low"
                     })
         except Exception as e:
             print(f"Skipped {current}: {e}")
-        current -= datetime.timedelta(days=1)  # go backwards
+        current -= datetime.timedelta(days=1)
         time.sleep(0.1)
-                                        
-    # Sort by symbol and date to keep order
+
     df = pd.DataFrame(all_data)
+    if df.empty:
+        raise ValueError(f"No recent data was returned for symbol {symbol}.")
+
     df = df.sort_values(by=["date"])
 
     df["ma_5"] = df["close"].rolling(5).mean()
     df["volatility_10"] = df["close"].pct_change().rolling(10).std()
+    df[feature_cols] = df[feature_cols].bfill().ffill()
 
-    # Shift close price by -1 (next day’s close)
-    df = df.fillna(method='ffill')
-    df = df.fillna(method='bfill')
-    scaler = joblib.load("scaler.joblib")
+    if len(df) < window_size:
+        raise ValueError(f"Not enough rows to build a {window_size}-day sequence for {symbol}.")
 
+    scaler = joblib.load(MODEL_DIR / "scaler.joblib")
     df[feature_cols] = scaler.transform(df[feature_cols])
 
-    X = build_sequences(df, window_size=window_size, feature_cols=feature_cols)
-    return X[-1].reshape(1, window_size, len(feature_cols))  # latest 7-day window only
+    window = df[feature_cols].tail(window_size).to_numpy(dtype=np.float32)
+    return window.reshape(1, window_size, len(feature_cols))
 
 
-def inference( symbol): 
-    model =  Sequential([
-    LSTM(units=50, return_sequences=False, input_shape=(7, 7)),
-    Dropout(0.2),
-    Dense(units=25),
-    Dense(units=1, activation= "sigmoid")
-])
-    model.load_weights('forecast_model.weights.h5')
+def load_model(window_size=7, feature_count=7):
+    try:
+        from tensorflow.keras.layers import Dense, Dropout, LSTM
+        from tensorflow.keras.models import Sequential
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "TensorFlow is not installed. Use Python 3.11/3.12 and install requirements.txt before inference."
+        ) from error
+
+    model = Sequential(
+        [
+            LSTM(units=50, return_sequences=False, input_shape=(window_size, feature_count)),
+            Dropout(0.2),
+            Dense(units=25),
+            Dense(units=1, activation="sigmoid"),
+        ]
+    )
+    model.load_weights(MODEL_DIR / "forecast_model.weights.h5")
+    return model
+
+
+def inference(symbol):
+    model = load_model(window_size=7, feature_count=len(FEATURE_COLUMNS))
     X = data_formatting(symbol)
-    prediction = model.predict(X)
-    number = (prediction[0]>0.5).astype(int)    
+    prediction = model.predict(X, verbose=0)
+    number = int(prediction[0][0] >= 0.5)
     if number == 1:
         return "UP"
-    else:    
+    else:
         return "DOWN"
 
 
-#just for testing purpose
-if __name__ == '__main__':
+if __name__ == "__main__":
     print(inference("NABIL"))
